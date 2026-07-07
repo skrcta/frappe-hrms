@@ -1,0 +1,239 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    # Run daily at 04:00 UTC
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (log actions without pushing)"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: "https://github.com/frappe/hrms.git"
+      # Branches to sync — must exist on both upstream and origin
+      SYNC_BRANCHES: "develop version-14 version-15 version-15-hotfix version-16 version-16-hotfix"
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so fast-forward merge works
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" || true
+          git fetch upstream --tags --prune
+
+      - name: Sync branches
+        id: sync-branches
+        run: |
+          FAILED_BRANCHES=""
+          SYNCED_BRANCHES=""
+
+          for BRANCH in $SYNC_BRANCHES; do
+            echo "::group::Processing branch: $BRANCH"
+
+            # Check if the branch exists on upstream
+            if ! git ls-remote --exit-code --heads upstream "$BRANCH" > /dev/null 2>&1; then
+              echo "⏭️  Branch '$BRANCH' does not exist on upstream — skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Check if the branch exists on origin
+            if ! git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+              echo "⏭️  Branch '$BRANCH' does not exist on origin — skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Fetch the latest for both
+            git fetch origin "$BRANCH"
+            git fetch upstream "$BRANCH"
+
+            ORIGIN_SHA=$(git rev-parse "origin/$BRANCH")
+            UPSTREAM_SHA=$(git rev-parse "upstream/$BRANCH")
+
+            if [ "$ORIGIN_SHA" = "$UPSTREAM_SHA" ]; then
+              echo "✅ Branch '$BRANCH' is already up-to-date ($ORIGIN_SHA)"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Check if fast-forward is possible:
+            # upstream/BRANCH must be a descendant of origin/BRANCH
+            if git merge-base --is-ancestor "origin/$BRANCH" "upstream/$BRANCH"; then
+              COMMIT_COUNT=$(git rev-list --count "origin/$BRANCH..upstream/$BRANCH")
+              echo "⏩ Fast-forwarding '$BRANCH': $COMMIT_COUNT new commit(s)"
+              echo "   origin  = $ORIGIN_SHA"
+              echo "   upstream = $UPSTREAM_SHA"
+
+              if [ "${{ inputs.dry_run }}" != "true" ]; then
+                git push origin "upstream/$BRANCH:refs/heads/$BRANCH"
+                echo "✅ Pushed '$BRANCH' successfully"
+              else
+                echo "🏜️  DRY RUN — would push '$BRANCH'"
+              fi
+              SYNCED_BRANCHES="$SYNCED_BRANCHES $BRANCH"
+            else
+              echo "❌ Cannot fast-forward '$BRANCH' — fork has diverged from upstream"
+              FAILED_BRANCHES="$FAILED_BRANCHES $BRANCH"
+            fi
+
+            echo "::endgroup::"
+          done
+
+          # Export results for downstream steps
+          echo "synced=$(echo $SYNCED_BRANCHES | xargs)" >> "$GITHUB_OUTPUT"
+          echo "failed=$(echo $FAILED_BRANCHES | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Sync tags
+        id: sync-tags
+        run: |
+          echo "::group::Syncing tags"
+
+          # Get tags that exist on upstream but not on origin
+          UPSTREAM_TAGS=$(git tag -l --sort=-v:refname)
+          NEW_TAGS=""
+
+          # Fetch origin tags for comparison
+          git fetch origin --tags
+
+          for TAG in $(git ls-remote --tags upstream | grep -v '{}' | awk '{print $2}' | sed 's|refs/tags/||'); do
+            if ! git rev-parse "refs/tags/$TAG" > /dev/null 2>&1; then
+              NEW_TAGS="$NEW_TAGS $TAG"
+            fi
+          done
+
+          NEW_TAGS=$(echo "$NEW_TAGS" | xargs)
+
+          if [ -z "$NEW_TAGS" ]; then
+            echo "✅ All tags are already synced"
+          else
+            echo "🏷️  New tags from upstream: $NEW_TAGS"
+            if [ "${{ inputs.dry_run }}" != "true" ]; then
+              # Push all upstream tags to origin
+              git push origin --tags
+              echo "✅ Tags pushed successfully"
+            else
+              echo "🏜️  DRY RUN — would push tags: $NEW_TAGS"
+            fi
+          fi
+
+          echo "new_tags=$NEW_TAGS" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Open issue for diverged branches
+        if: steps.sync-branches.outputs.failed != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const failedBranches = "${{ steps.sync-branches.outputs.failed }}".split(" ").filter(Boolean);
+            const title = `⚠️ Fork sync: ${failedBranches.length} branch(es) diverged from upstream`;
+
+            // Check if an open issue with this title already exists
+            const { data: existingIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: "upstream-sync",
+            });
+
+            const alreadyOpen = existingIssues.find(i => i.title === title);
+            if (alreadyOpen) {
+              console.log(`Issue already open: #${alreadyOpen.number} — skipping`);
+              return;
+            }
+
+            const branchDetails = failedBranches.map(b =>
+              `- \`${b}\`: cannot fast-forward — the fork has commits not in upstream`
+            ).join("\n");
+
+            const body = [
+              `## Upstream Sync Failure`,
+              ``,
+              `The daily sync workflow could not fast-forward the following branch(es):`,
+              ``,
+              branchDetails,
+              ``,
+              `### What to do`,
+              ``,
+              `1. **If the fork-only commits are intentional**, rebase them on top of upstream:`,
+              `   \`\`\`bash`,
+              `   git fetch upstream`,
+              `   git checkout <branch>`,
+              `   git rebase upstream/<branch>`,
+              `   git push origin <branch> --force-with-lease`,
+              `   \`\`\``,
+              `2. **If the fork-only commits were accidental**, force-push upstream's version:`,
+              `   \`\`\`bash`,
+              `   git fetch upstream`,
+              `   git push origin upstream/<branch>:refs/heads/<branch> --force`,
+              `   \`\`\``,
+              ``,
+              `> Upstream: \`frappe/hrms\``,
+              `> Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ].join("\n");
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ["upstream-sync"],
+            });
+
+      - name: Summary
+        run: |
+          echo "## 📋 Sync Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          SYNCED="${{ steps.sync-branches.outputs.synced }}"
+          FAILED="${{ steps.sync-branches.outputs.failed }}"
+          NEW_TAGS="${{ steps.sync-tags.outputs.new_tags }}"
+
+          if [ -n "$SYNCED" ]; then
+            echo "### ✅ Branches synced" >> "$GITHUB_STEP_SUMMARY"
+            for B in $SYNCED; do
+              echo "- \`$B\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -n "$FAILED" ]; then
+            echo "### ❌ Branches diverged (issue opened)" >> "$GITHUB_STEP_SUMMARY"
+            for B in $FAILED; do
+              echo "- \`$B\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -n "$NEW_TAGS" ]; then
+            echo "### 🏷️ New tags synced" >> "$GITHUB_STEP_SUMMARY"
+            for T in $NEW_TAGS; do
+              echo "- \`$T\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -z "$SYNCED" ] && [ -z "$FAILED" ] && [ -z "$NEW_TAGS" ]; then
+            echo "Everything is already up-to-date with upstream. ✨" >> "$GITHUB_STEP_SUMMARY"
+          fi
