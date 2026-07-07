@@ -22,7 +22,9 @@ jobs:
     env:
       UPSTREAM_REPO: "https://github.com/frappe/hrms.git"
       # Branches to sync — must exist on both upstream and origin
-      SYNC_BRANCHES: "develop version-14 version-15 version-15-hotfix version-16 version-16-hotfix"
+      # NOTE: develop is excluded because it carries fork-specific commits
+      # (e.g. this workflow file) that will always diverge from upstream.
+      SYNC_BRANCHES: "version-14 version-15 version-15-hotfix version-16 version-16-hotfix"
 
     steps:
       - name: Checkout fork
