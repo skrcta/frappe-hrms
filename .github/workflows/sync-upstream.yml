@@ -143,6 +143,38 @@ jobs:
           echo "new_tags=$NEW_TAGS" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
 
+      - name: Trigger Docker image build
+        if: steps.sync-tags.outputs.new_tags != '' && inputs.dry_run != 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.IMAGES_REPO_PAT }}
+          script: |
+            const newTags = "${{ steps.sync-tags.outputs.new_tags }}".split(" ").filter(Boolean);
+
+            // Only build release tags (vX.Y.Z), skip asset tags etc.
+            const releaseTags = newTags.filter(t => /^v\d+\.\d+\.\d+$/.test(t));
+
+            if (releaseTags.length === 0) {
+              console.log("No release tags to build — skipping dispatch");
+              return;
+            }
+
+            console.log(`🐳 Dispatching image build for: ${releaseTags.join(", ")}`);
+
+            await github.rest.repos.createDispatchEvent({
+              owner: "skrcta",
+              repo: "frappe-hrms-images",
+              event_type: "new-hrms-tags",
+              client_payload: {
+                tags: releaseTags,
+                frappe_branch: "version-15",
+                source: "sync-upstream",
+              },
+            });
+
+            console.log("✅ Dispatch sent to skrcta/frappe-hrms-images");
+
       - name: Open issue for diverged branches
         if: steps.sync-branches.outputs.failed != ''
         continue-on-error: true
